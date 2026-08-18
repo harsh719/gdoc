@@ -1,0 +1,22 @@
+{
+  "title": "gdoc skill — Self-Test Document",
+  "lede": "This is a throwaway test of the gdoc builder. It exercises every block type so we can confirm the formatting matches the reference spec before shipping the skill.",
+  "blocks": [
+    {"t": "h2", "text": "1. Headings and Body"},
+    {"t": "h3", "text": "A subsection"},
+    {"t": "body", "text": "A normal paragraph with **bold text**, some `inline code`, and a [link](https://example.com) to confirm inline styling works end to end."},
+    {"t": "h2", "text": "2. Lists"},
+    {"t": "h3", "text": "Bulleted points"},
+    {"t": "bullet", "text": "**First label** — a bullet with a bold lead-in label."},
+    {"t": "bullet", "text": "A second plain bullet point."},
+    {"t": "h3", "text": "Ordered steps"},
+    {"t": "num", "text": "Step one."},
+    {"t": "num", "text": "Step two."},
+    {"t": "h2", "text": "3. Code Block"},
+    {"t": "label", "text": "Example payload"},
+    {"t": "code", "text": "POST /v1/connect\n{\n  \"account\": \"flagship\",\n  \"contracts\": 5\n}"},
+    {"t": "h2", "text": "4. Table"},
+    {"t": "body", "text": "A real Google Docs table with a bold, shaded header row:"},
+    {"t": "table", "header": ["Tool", "Purpose", "Plan"], "rows": [["Unipile", "LinkedIn API backend", "Shared client account"], ["AdsPower", "Browser isolation", "Professional"], ["proxy-cheap", "Residential IPs", "Premium static"]]}
+  ]
+}
