@@ -1,7 +1,7 @@
 """Build a clean, skimmable Google Doc to the locked house spec.
 
 Produces docs matching the reference style: Geist font, H1/H2/H3 hierarchy,
-11pt body + bullets, bold lead-in labels, indented bordered code blocks, and
+11pt body + bullets, bold lead-in labels, indented code blocks (no border), and
 REAL Google Docs tables with a bold header row.
 
 Auth: reuses the nuBeam Second Brain OAuth helper (operations@nubeam.io).
@@ -120,13 +120,9 @@ BLOCK_SPEC = {
     "label":  ("NORMAL_TEXT", 11, True,  8,  2,  None, None),
     "code":   ("NORMAL_TEXT", 10, False, 4,  8,  {"red": 0.2, "green": 0.2, "blue": 0.2}, {
         "indentStart": _pt(18),
+        "indentFirstLine": _pt(18),  # must equal indentStart or wrapped lines hang (2026-10-01)
         "indentEnd": _pt(18),
-        "borderLeft": {
-            "color": {"color": {"rgbColor": {"red": 0.75, "green": 0.75, "blue": 0.75}}},
-            "width": _pt(2),
-            "padding": _pt(8),
-            "dashStyle": "SOLID",
-        },
+        # NO borderLeft: Harsh banned the grey vertical line (2026-10-01).
     }),
 }
 
@@ -159,8 +155,13 @@ def parse_inline(text: str):
         m = BOLD_RE.match(text, i)
         if m:
             start = len("".join(out))
-            out.append(m.group(1))
-            styles.append({"type": "bold", "start": start, "end": start + len(m.group(1))})
+            # Recurse: bold can wrap a link, e.g. **[title](url)**. Without this the
+            # inner markdown is emitted literally and leaks into the document.
+            inner_plain, inner_styles = parse_inline(m.group(1))
+            out.append(inner_plain)
+            styles.append({"type": "bold", "start": start, "end": start + len(inner_plain)})
+            for st in inner_styles:
+                styles.append({**st, "start": start + st["start"], "end": start + st["end"]})
             i = m.end()
             continue
         m = CODE_RE.match(text, i)
@@ -213,10 +214,19 @@ def build_doc(spec: dict, doc_id: str | None = None):
     para_ops: list[tuple] = []      # (start, end, kind)
     inline_ops: list[dict] = []     # absolute inline style ranges
     table_jobs: list[dict] = []     # {index, header, rows}
+    image_jobs: list[dict] = []     # {index, path, width}
     cursor = 1
 
     for b in blocks:
         kind = b["t"]
+        if kind == "image":
+            # placeholder empty paragraph; the inline image is inserted here later
+            seg = "\n"
+            text_parts.append(seg)
+            image_jobs.append({"index": cursor, "path": b["path"], "width": b.get("width", 468),
+                               "caption": b.get("caption")})
+            cursor += len(seg)
+            continue
         if kind == "table":
             # placeholder empty paragraph; real table inserted here later
             seg = "\n"
@@ -291,15 +301,81 @@ def build_doc(spec: dict, doc_id: str | None = None):
     docs.documents().batchUpdate(documentId=doc_id, body={"requests": [
         {"updateDocumentStyle": {"documentStyle": {
             "marginTop": _pt(72), "marginBottom": _pt(72),
-            "marginLeft": _pt(72), "marginRight": _pt(72)},
-            "fields": "marginTop,marginBottom,marginLeft,marginRight"}}
+            "marginLeft": _pt(72), "marginRight": _pt(72),
+            "documentFormat": {"documentMode": "PAGES"}},
+            "fields": "marginTop,marginBottom,marginLeft,marginRight,documentFormat"}}
     ]}).execute()
 
-    # Pass 4: tables, bottom-to-top so earlier placeholder indices stay valid.
-    for job in sorted(table_jobs, key=lambda j: -j["index"]):
-        _insert_table(docs, doc_id, job["index"], job.get("header"), job.get("rows", []))
+    # Pass 4: tables + images, bottom-to-top so earlier placeholder indices stay valid.
+    jobs = [dict(j, kind="table") for j in table_jobs] + [dict(j, kind="image") for j in image_jobs]
+    uploaded: list[str] = []
+    for job in sorted(jobs, key=lambda j: -j["index"]):
+        if job["kind"] == "table":
+            _insert_table(docs, doc_id, job["index"], job.get("header"), job.get("rows", []))
+        else:
+            fid = _insert_image(docs, doc_id, job["index"], job["path"], job["width"], job.get("caption"))
+            if fid:
+                uploaded.append(fid)
+    # revoke the temporary anyone-with-link share used so Docs could fetch the bytes
+    for fid in uploaded:
+        try:
+            drive_service().permissions().delete(fileId=fid, permissionId="anyoneWithLink").execute()
+        except Exception:
+            pass
 
     return doc_id
+
+
+_IMG_FOLDER_CACHE: dict = {}
+
+
+def _img_folder(drive):
+    """One Drive folder that holds images embedded by this builder (kept so the doc's images stay resolvable)."""
+    if "id" in _IMG_FOLDER_CACHE:
+        return _IMG_FOLDER_CACHE["id"]
+    q = "name='gdoc-builder-images' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    r = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if r:
+        fid = r[0]["id"]
+    else:
+        fid = drive.files().create(body={"name": "gdoc-builder-images",
+                                         "mimeType": "application/vnd.google-apps.folder"}, fields="id").execute()["id"]
+    _IMG_FOLDER_CACHE["id"] = fid
+    return fid
+
+
+def _insert_image(docs, doc_id, at_index, path, width_pt, caption=None):
+    """Upload a local image to Drive, share it by link for the fetch, insert it inline at `at_index`
+    (the placeholder paragraph), sized to `width_pt` wide (aspect preserved). Returns the Drive file id."""
+    from googleapiclient.http import MediaFileUpload
+    p = Path(path)
+    if not p.exists():
+        print(f"[image] missing: {path}", file=sys.stderr)
+        return None
+    drive = drive_service()
+    mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+    meta = {"name": p.name, "parents": [_img_folder(drive)]}
+    f = drive.files().create(body=meta, media_body=MediaFileUpload(str(p), mimetype=mime),
+                             fields="id").execute()
+    fid = f["id"]
+    drive.permissions().create(fileId=fid, body={"type": "anyone", "role": "reader"}).execute()
+    uri = f"https://drive.google.com/uc?export=download&id={fid}"
+    # width only: Docs keeps the aspect ratio when a single dimension is given
+    reqs = [{"insertInlineImage": {"location": {"index": at_index}, "uri": uri,
+                                   "objectSize": {"width": _pt(width_pt)}}}]
+    if caption:
+        reqs.append({"insertText": {"location": {"index": at_index + 1}, "text": "\n" + caption}})
+    docs.documents().batchUpdate(documentId=doc_id, body={"requests": reqs}).execute()
+    if caption:
+        d = docs.documents().get(documentId=doc_id).execute()
+        # style the caption paragraph (the one right after the image) as small grey text
+        st = at_index + 2; en = st + len(caption)
+        docs.documents().batchUpdate(documentId=doc_id, body={"requests": [
+            {"updateTextStyle": {"range": {"startIndex": st, "endIndex": en},
+                                 "textStyle": {"fontSize": _pt(9), "italic": True,
+                                               "foregroundColor": {"color": {"rgbColor": {"red": 0.45, "green": 0.45, "blue": 0.5}}}},
+                                 "fields": "fontSize,italic,foregroundColor"}}]}).execute()
+    return fid
 
 
 def _insert_table(docs, doc_id, at_index, header, rows):
@@ -368,6 +444,23 @@ def _insert_table(docs, doc_id, at_index, header, rows):
                         },
                         "rowSpan": 1, "columnSpan": 1,
                     }}})
+    # Fit columns to the page content width (612pt letter - 72pt margins each side),
+    # weighting wider columns by their longest cell text so nothing cuts off in page mode.
+    content_w = 612 - 72 - 72 - 2
+    lens = [0] * ncols
+    for row in data:
+        for c, val in enumerate(row):
+            lens[c] = max(lens[c], min(len(str(val)), 60))
+    weights = [max(n, 6) ** 0.8 for n in lens]
+    widths = [max(55, content_w * w / sum(weights)) for w in weights]
+    scale = content_w / sum(widths)
+    style_reqs += [{"updateTableColumnProperties": {
+        "tableStartLocation": {"index": table_el["startIndex"]},
+        "columnIndices": [c],
+        "tableColumnProperties": {"widthType": "FIXED_WIDTH",
+                                  "width": {"magnitude": round(w * scale, 1), "unit": "PT"}},
+        "fields": "widthType,width"}} for c, w in enumerate(widths)]
+
     for i in range(0, len(style_reqs), 400):
         docs.documents().batchUpdate(documentId=doc_id, body={"requests": style_reqs[i:i + 400]}).execute()
 
